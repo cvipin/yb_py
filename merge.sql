@@ -1,17 +1,124 @@
-/*
-1. Physical Staging Table DDL (Partitioned by WORK_STREAM)
-Each staging table is list-partitioned into three isolated work streams:
+------------------------------------------ DDL
+-- Daily Match Engine Output Table
+CREATE TABLE PME_MTCH (
+    ID1           NUMBER       NOT NULL,
+    ID2           NUMBER       NOT NULL,
+    ID1_PARTY_TYP VARCHAR2(10) NOT NULL,
+    ID2_PARTY_TYP VARCHAR2(10) NOT NULL,
+    PAIR_TYP      VARCHAR2(10) GENERATED ALWAYS AS (
+                      CASE
+                          WHEN ID1_PARTY_TYP = ID2_PARTY_TYP THEN ID1_PARTY_TYP
+                          ELSE 'CROSS'
+                      END
+                  ) VIRTUAL
+);
 
-P_BSNS (Used exclusively by the parallel BSNS job)
+-- Daily Parties Sent to PME (For Auto-Unmerge when PME returns 0 matches)
+CREATE TABLE PME_SENT_PARTIES (
+    PARTY_TYP VARCHAR2(10) NOT NULL,
+    NODE_ID   NUMBER       NOT NULL,
+    CONSTRAINT PK_PME_SENT_PARTIES PRIMARY KEY (PARTY_TYP, NODE_ID) USING INDEX LOCAL
+)
+PARTITION BY LIST (PARTY_TYP) (
+    PARTITION P_BSNS  VALUES ('BSNS'),
+    PARTITION P_INDVL VALUES ('INDVL')
+);
 
-P_INDVL (Used exclusively by the parallel INDVL job)
+-------------------------------------------------------------------------------
+-- 2. NORMALIZED PAIR TABLES WITH VIRTUAL COLUMN PARTITIONING
+-------------------------------------------------------------------------------
+-- Accumulated Match History (160M+ Unique Pairs)
+CREATE TABLE PME_MTCH_HIST (
+    ID1           NUMBER       NOT NULL,
+    ID2           NUMBER       NOT NULL,
+    ID1_PARTY_TYP VARCHAR2(10) NOT NULL,
+    ID2_PARTY_TYP VARCHAR2(10) NOT NULL,
+    CREATED_DT    DATE         DEFAULT SYSDATE,
+    PAIR_TYP      VARCHAR2(10) GENERATED ALWAYS AS (
+                      CASE
+                          WHEN ID1_PARTY_TYP = ID2_PARTY_TYP THEN ID1_PARTY_TYP
+                          ELSE 'CROSS'
+                      END
+                  ) VIRTUAL,
+    CONSTRAINT CHK_HIST_ID_ORDER CHECK (ID1 < ID2),
+    CONSTRAINT PK_PME_MTCH_HIST PRIMARY KEY (PAIR_TYP, ID1, ID2) USING INDEX LOCAL
+)
+PARTITION BY LIST (PAIR_TYP) (
+    PARTITION P_BSNS  VALUES ('BSNS'),
+    PARTITION P_INDVL VALUES ('INDVL'),
+    PARTITION P_CROSS VALUES ('CROSS')
+);
 
-P_CROSS (Used exclusively by the sequential CROSS job)
+-- Manual Overrides Table (Priority over PME_MTCH_HIST)
+CREATE TABLE PME_MANUAL_OVERRIDES (
+    ID1           NUMBER       NOT NULL,
+    ID2           NUMBER       NOT NULL,
+    ID1_PARTY_TYP VARCHAR2(10) NOT NULL,
+    ID2_PARTY_TYP VARCHAR2(10) NOT NULL,
+    ISMERGE       NUMBER(1)    DEFAULT 0 NOT NULL,
+    ISUNMERGE     NUMBER(1)    DEFAULT 0 NOT NULL,
+    CREATED_DT    DATE         DEFAULT SYSDATE,
+    PAIR_TYP      VARCHAR2(10) GENERATED ALWAYS AS (
+                      CASE
+                          WHEN ID1_PARTY_TYP = ID2_PARTY_TYP THEN ID1_PARTY_TYP
+                          ELSE 'CROSS'
+                      END
+                  ) VIRTUAL,
+    CONSTRAINT CHK_OVR_ID_ORDER CHECK (ID1 < ID2),
+    CONSTRAINT CHK_OVR_FLAGS    CHECK ((ISMERGE = 1 AND ISUNMERGE = 0) OR (ISMERGE = 0 AND ISUNMERGE = 1)),
+    CONSTRAINT PK_PME_OVERRIDES PRIMARY KEY (PAIR_TYP, ID1, ID2) USING INDEX LOCAL
+)
+PARTITION BY LIST (PAIR_TYP) (
+    PARTITION P_BSNS  VALUES ('BSNS'),
+    PARTITION P_INDVL VALUES ('INDVL'),
+    PARTITION P_CROSS VALUES ('CROSS')
+);
 
-Because Oracle allows two sessions to run ALTER TABLE ... TRUNCATE PARTITION and INSERT INTO ... PARTITION (...) on different partitions of the same physical table simultaneously, BSNS and INDVL run in parallel with zero lock contention.
-*/
+-- Final Cluster Output Table (Partitioned by NODE_PARTY_TYP)
+CREATE TABLE PME_CLUSTER_RESULT (
+    CLUSTER_ROOT   NUMBER       NOT NULL,
+    NODE_ID        NUMBER       NOT NULL,
+    ROOT_PARTY_TYP VARCHAR2(10) NOT NULL,
+    NODE_PARTY_TYP VARCHAR2(10) NOT NULL,
+    IS_CROSS_TYPE  VARCHAR2(1)  GENERATED ALWAYS AS (
+                       CASE WHEN ROOT_PARTY_TYP <> NODE_PARTY_TYP THEN 'Y' ELSE 'N' END
+                   ) VIRTUAL,
+    UPDATED_DT     DATE         DEFAULT SYSDATE,
+    CONSTRAINT PK_PME_CLUSTER_RESULT PRIMARY KEY (NODE_PARTY_TYP, NODE_ID) USING INDEX LOCAL
+)
+PARTITION BY LIST (NODE_PARTY_TYP) (
+    PARTITION P_BSNS  VALUES ('BSNS'),
+    PARTITION P_INDVL VALUES ('INDVL')
+);
+CREATE INDEX IDX_PME_CLUST_ROOT ON PME_CLUSTER_RESULT (NODE_PARTY_TYP, CLUSTER_ROOT) LOCAL;
 
--- 1. Physical Staging Table for Active Undirected Edges
+-- Audit Log for Transitive Bridges Broken by Unmerges
+CREATE TABLE PME_TRANSITIVE_CUT_LOG (
+    WORK_STREAM    VARCHAR2(10) NOT NULL,
+    UNMERGE_ANCHOR NUMBER       NOT NULL,
+    UNMERGE_TARGET NUMBER       NOT NULL,
+    CUT_NODE_1     NUMBER       NOT NULL,
+    CUT_NODE_2     NUMBER       NOT NULL,
+    LOGGED_DT      DATE         DEFAULT SYSDATE
+);
+
+-------------------------------------------------------------------------------
+-- 3. PHYSICAL STAGING TABLES (REPLACING GTTs, PARTITIONED BY WORK_STREAM)
+-------------------------------------------------------------------------------
+-- 3a. Raw Deduplicated Pairs + Degree-1 Fast-Path Flag
+CREATE TABLE STG_RAW_PAIRS (
+    WORK_STREAM VARCHAR2(10) NOT NULL,
+    ID1         NUMBER       NOT NULL,
+    ID2         NUMBER       NOT NULL,
+    IS_DEGREE_1 NUMBER(1)    NOT NULL
+) NOLOGGING
+PARTITION BY LIST (WORK_STREAM) (
+    PARTITION P_BSNS  VALUES ('BSNS'),
+    PARTITION P_INDVL VALUES ('INDVL'),
+    PARTITION P_CROSS VALUES ('CROSS')
+);
+
+-- 3b. Active Undirected Graph Edges (Only Complex Clusters: IS_DEGREE_1 = 0)
 CREATE TABLE STG_ACTIVE_EDGES (
     WORK_STREAM VARCHAR2(10) NOT NULL,
     U_NODE      NUMBER       NOT NULL,
@@ -22,9 +129,9 @@ PARTITION BY LIST (WORK_STREAM) (
     PARTITION P_INDVL VALUES ('INDVL'),
     PARTITION P_CROSS VALUES ('CROSS')
 );
-CREATE INDEX IDX_STG_EDGES_UV ON STG_ACTIVE_EDGES(WORK_STREAM, U_NODE, V_NODE) LOCAL NOLOGGING;
+CREATE INDEX IDX_STG_EDGES_UV ON STG_ACTIVE_EDGES (WORK_STREAM, U_NODE, V_NODE) LOCAL NOLOGGING;
 
--- 2. Physical Staging Table for Iterative Cluster Convergence
+-- 3c. Iterative Node -> Cluster Root Convergence Table
 CREATE TABLE STG_NODE_CLUSTER (
     WORK_STREAM  VARCHAR2(10) NOT NULL,
     NODE_ID      NUMBER       NOT NULL,
@@ -37,7 +144,7 @@ PARTITION BY LIST (WORK_STREAM) (
     PARTITION P_CROSS VALUES ('CROSS')
 );
 
--- 3. Physical Staging Table for Impacted Nodes & Dependencies
+-- 3d. Impacted Nodes & Dependencies
 CREATE TABLE STG_IMPACTED_NODES (
     WORK_STREAM VARCHAR2(10) NOT NULL,
     NODE_ID     NUMBER       NOT NULL,
@@ -49,7 +156,7 @@ PARTITION BY LIST (WORK_STREAM) (
     PARTITION P_CROSS VALUES ('CROSS')
 );
 
--- 4. Physical Staging Table for Active Unmerge Rules
+-- 3e. Active Unmerge Rules for the Current Run
 CREATE TABLE STG_UNMERGE_RULES (
     WORK_STREAM VARCHAR2(10) NOT NULL,
     ANCHOR_NODE NUMBER       NOT NULL,
@@ -62,25 +169,60 @@ PARTITION BY LIST (WORK_STREAM) (
     PARTITION P_CROSS VALUES ('CROSS')
 );
 
-/*
-2. Phase 1 & 2 Procedure (BSNS and INDVL Using Physical Tables)
-Notice how every TRUNCATE targets only the active partition (P_BSNS or P_INDVL), and every query filters on WORK_STREAM = p_party_typ so Oracle performs Partition Pruning to a single partition.
-*/
+---------------------------------
+
+CREATE OR REPLACE TRIGGER TRG_BIU_PME_MANUAL_OVERRIDES
+BEFORE INSERT OR UPDATE OF ID1, ID2, ID1_PARTY_TYP, ID2_PARTY_TYP
+ON PME_MANUAL_OVERRIDES
+FOR EACH ROW
+DECLARE
+    v_tmp_id   NUMBER;
+    v_tmp_type VARCHAR2(10);
+BEGIN
+    -- Look up ID1_PARTY_TYP from PARTY_XREF if not provided
+    IF :NEW.ID1_PARTY_TYP IS NULL THEN
+        SELECT PARTY_TYP INTO :NEW.ID1_PARTY_TYP
+          FROM PARTY_XREF
+         WHERE ORIG_ROWID_OBJECT = :NEW.ID1;
+    END IF;
+
+    -- Look up ID2_PARTY_TYP from PARTY_XREF if not provided
+    IF :NEW.ID2_PARTY_TYP IS NULL THEN
+        SELECT PARTY_TYP INTO :NEW.ID2_PARTY_TYP
+          FROM PARTY_XREF
+         WHERE ORIG_ROWID_OBJECT = :NEW.ID2;
+    END IF;
+
+    -- Normalize so ID1 < ID2 and keep PARTY_TYP aligned with its ID
+    IF :NEW.ID1 > :NEW.ID2 THEN
+        v_tmp_id           := :NEW.ID1;
+        v_tmp_type         := :NEW.ID1_PARTY_TYP;
+
+        :NEW.ID1           := :NEW.ID2;
+        :NEW.ID1_PARTY_TYP := :NEW.ID2_PARTY_TYP;
+
+        :NEW.ID2           := v_tmp_id;
+        :NEW.ID2_PARTY_TYP := v_tmp_type;
+    END IF;
+END;
+/
+
+------------------------------------------------ Procs
 
 CREATE OR REPLACE PROCEDURE PRC_RUN_MDM_MERGE_BY_TYPE (
-    p_party_typ IN VARCHAR2,                 -- Pass 'BSNS' or 'INDVL'
-    p_run_mode  IN VARCHAR2 DEFAULT 'DELTA'  -- Pass 'DAY1' or 'DELTA'
+    p_party_typ IN VARCHAR2,                 -- 'BSNS' or 'INDVL'
+    p_run_mode  IN VARCHAR2 DEFAULT 'DELTA'  -- 'DAY1' or 'DELTA'
 ) AS
     v_part_name VARCHAR2(30) := 'P_' || UPPER(p_party_typ);
 
-    -- Internal helper: Truncate only this stream's partition on a staging table
+    -- Truncate only this work stream's partition
     PROCEDURE truncate_stream_partition (p_table_name IN VARCHAR2) IS
     BEGIN
         EXECUTE IMMEDIATE 'ALTER TABLE ' || p_table_name ||
                           ' TRUNCATE PARTITION ' || v_part_name || ' UPDATE INDEXES';
     END truncate_stream_partition;
 
-    -- Internal helper: Min-Label Propagation + Pointer Jumping on Physical Tables
+    -- Min-Label Propagation + Pointer Jumping
     PROCEDURE run_label_propagation (p_exclude_targets IN BOOLEAN) IS
         v_rows_updated NUMBER := 1;
     BEGIN
@@ -155,84 +297,290 @@ CREATE OR REPLACE PROCEDURE PRC_RUN_MDM_MERGE_BY_TYPE (
 BEGIN
     EXECUTE IMMEDIATE 'ALTER SESSION ENABLE PARALLEL DML';
 
-    -- Clear ONLY this party_typ's partitions (Zero lock impact on the other stream)
+    -- Clear ONLY this stream's partitions
+    truncate_stream_partition('STG_RAW_PAIRS');
     truncate_stream_partition('STG_ACTIVE_EDGES');
     truncate_stream_partition('STG_NODE_CLUSTER');
     truncate_stream_partition('STG_IMPACTED_NODES');
     truncate_stream_partition('STG_UNMERGE_RULES');
 
     ---------------------------------------------------------------------------
-    -- STEP 1: ACCUMULATE INTRA-TYPE PME_MTCH_HIST
+    -- STEP 1: SEED / REFRESH PME_MTCH_HIST & CAPTURE DELTA DEPENDENCIES
     ---------------------------------------------------------------------------
     IF UPPER(p_run_mode) = 'DAY1' THEN
+        -- Seed Day 1 same-type pairs from PARTY_XREF
         MERGE /*+ PARALLEL(4) */ INTO PME_MTCH_HIST h
         USING (
             SELECT DISTINCT
-                   x1.PARTY_TYP,
-                   LEAST(x1.ROWID_OBJECT, x1.ORIG_ROWID_OBJECT)    AS ID1,
-                   GREATEST(x1.ROWID_OBJECT, x1.ORIG_ROWID_OBJECT) AS ID2
+                   CASE WHEN x1.ROWID_OBJECT < x1.ORIG_ROWID_OBJECT
+                        THEN x1.ROWID_OBJECT      ELSE x1.ORIG_ROWID_OBJECT END AS ID1,
+                   CASE WHEN x1.ROWID_OBJECT < x1.ORIG_ROWID_OBJECT
+                        THEN x1.ORIG_ROWID_OBJECT ELSE x1.ROWID_OBJECT      END AS ID2,
+                   p_party_typ AS ID1_PARTY_TYP,
+                   p_party_typ AS ID2_PARTY_TYP,
+                   p_party_typ AS CALC_PAIR_TYP
               FROM PARTY_XREF x1
               JOIN PARTY_XREF x2 ON x1.ROWID_OBJECT = x2.ORIG_ROWID_OBJECT
              WHERE x1.ROWID_OBJECT <> x1.ORIG_ROWID_OBJECT
                AND x1.PARTY_TYP = p_party_typ
                AND x2.PARTY_TYP = p_party_typ
         ) x
-        ON (h.PARTY_TYP = x.PARTY_TYP AND h.ID1 = x.ID1 AND h.ID2 = x.ID2)
+        ON (h.PAIR_TYP = x.CALC_PAIR_TYP AND h.ID1 = x.ID1 AND h.ID2 = x.ID2)
         WHEN NOT MATCHED THEN
-            INSERT (PARTY_TYP, ID1, ID2, CREATED_DT)
-            VALUES (x.PARTY_TYP, x.ID1, x.ID2, SYSDATE);
+            INSERT (ID1, ID2, ID1_PARTY_TYP, ID2_PARTY_TYP, CREATED_DT)
+            VALUES (x.ID1, x.ID2, x.ID1_PARTY_TYP, x.ID2_PARTY_TYP, SYSDATE);
+        COMMIT;
+
+    ELSE
+        -- DELTA MODE:
+        -- 1A. Seed impacted nodes BEFORE deleting stale PME_MTCH_HIST edges for PME_SENT_PARTIES
+        INSERT INTO STG_IMPACTED_NODES (WORK_STREAM, NODE_ID)
+        SELECT p_party_typ, NODE_ID
+          FROM (
+            SELECT ID1 AS NODE_ID FROM PME_MTCH WHERE PAIR_TYP = p_party_typ AND ID1 <> ID2
+            UNION
+            SELECT ID2 FROM PME_MTCH WHERE PAIR_TYP = p_party_typ AND ID1 <> ID2
+            UNION
+            SELECT ID1 FROM PME_MANUAL_OVERRIDES WHERE PAIR_TYP = p_party_typ AND (ISMERGE = 1 OR ISUNMERGE = 1)
+            UNION
+            SELECT ID2 FROM PME_MANUAL_OVERRIDES WHERE PAIR_TYP = p_party_typ AND (ISMERGE = 1 OR ISUNMERGE = 1)
+            UNION
+            SELECT s.NODE_ID
+              FROM PME_SENT_PARTIES s
+             WHERE s.PARTY_TYP = p_party_typ
+               AND (
+                   EXISTS (
+                       SELECT 1 FROM PARTY_XREF x
+                        WHERE x.PARTY_TYP = p_party_typ
+                          AND (x.ORIG_ROWID_OBJECT = s.NODE_ID OR x.ROWID_OBJECT = s.NODE_ID)
+                          AND x.ROWID_OBJECT <> x.ORIG_ROWID_OBJECT
+                   )
+                   OR EXISTS (
+                       SELECT 1 FROM PME_MTCH_HIST h
+                        WHERE h.PAIR_TYP = p_party_typ
+                          AND (h.ID1 = s.NODE_ID OR h.ID2 = s.NODE_ID)
+                   )
+               )
+          );
+        COMMIT;
+
+        -- 1B. Expand existing cluster members & prior history neighbors before purging stale edges
+        LOOP
+            INSERT INTO STG_IMPACTED_NODES (WORK_STREAM, NODE_ID)
+            WITH NEW_DEPS AS (
+                SELECT x.ORIG_ROWID_OBJECT AS DEP_NODE
+                  FROM PARTY_XREF x
+                 WHERE x.PARTY_TYP = p_party_typ
+                   AND x.ROWID_OBJECT IN (
+                       SELECT p.ROWID_OBJECT
+                         FROM PARTY_XREF p
+                         JOIN STG_IMPACTED_NODES i
+                           ON p.ORIG_ROWID_OBJECT = i.NODE_ID AND i.WORK_STREAM = p_party_typ
+                        WHERE p.PARTY_TYP = p_party_typ
+                       UNION
+                       SELECT NODE_ID FROM STG_IMPACTED_NODES WHERE WORK_STREAM = p_party_typ
+                   )
+                UNION
+                SELECT CASE WHEN h.ID1 = i.NODE_ID THEN h.ID2 ELSE h.ID1 END AS DEP_NODE
+                  FROM PME_MTCH_HIST h
+                  JOIN STG_IMPACTED_NODES i
+                    ON (h.ID1 = i.NODE_ID OR h.ID2 = i.NODE_ID) AND i.WORK_STREAM = p_party_typ
+                 WHERE h.PAIR_TYP = p_party_typ
+            )
+            SELECT DISTINCT p_party_typ, d.DEP_NODE
+              FROM NEW_DEPS d
+             WHERE NOT EXISTS (
+                   SELECT 1 FROM STG_IMPACTED_NODES e
+                    WHERE e.WORK_STREAM = p_party_typ AND e.NODE_ID = d.DEP_NODE
+             );
+
+            EXIT WHEN SQL%ROWCOUNT = 0;
+            COMMIT;
+        END LOOP;
+
+        -- 1C. Purge stale automated matches in PME_MTCH_HIST for parties re-evaluated by PME today
+        DELETE /*+ PARALLEL(4) */ FROM PME_MTCH_HIST h
+         WHERE h.PAIR_TYP = p_party_typ
+           AND (EXISTS (SELECT 1 FROM PME_SENT_PARTIES s WHERE s.PARTY_TYP = p_party_typ AND s.NODE_ID = h.ID1)
+             OR EXISTS (SELECT 1 FROM PME_SENT_PARTIES s WHERE s.PARTY_TYP = p_party_typ AND s.NODE_ID = h.ID2));
+        COMMIT;
     END IF;
 
+    -- 1D. Merge today's PME_MTCH into PME_MTCH_HIST (Normalized with corresponding PARTY_TYP)
     MERGE /*+ PARALLEL(4) */ INTO PME_MTCH_HIST h
     USING (
         SELECT DISTINCT
-               p_party_typ            AS PARTY_TYP,
-               LEAST(m.ID1, m.ID2)    AS ID1,
-               GREATEST(m.ID1, m.ID2) AS ID2
+               CASE WHEN m.ID1 < m.ID2 THEN m.ID1           ELSE m.ID2           END AS ID1,
+               CASE WHEN m.ID1 < m.ID2 THEN m.ID2           ELSE m.ID1           END AS ID2,
+               CASE WHEN m.ID1 < m.ID2 THEN m.ID1_PARTY_TYP ELSE m.ID2_PARTY_TYP END AS ID1_PARTY_TYP,
+               CASE WHEN m.ID1 < m.ID2 THEN m.ID2_PARTY_TYP ELSE m.ID1_PARTY_TYP END AS ID2_PARTY_TYP,
+               m.PAIR_TYP
           FROM PME_MTCH m
-         WHERE m.PARTY_TYP = p_party_typ
+         WHERE m.PAIR_TYP = p_party_typ
            AND m.ID1 <> m.ID2
-    ) m
-    ON (h.PARTY_TYP = m.PARTY_TYP AND h.ID1 = m.ID1 AND h.ID2 = m.ID2)
+    ) src
+    ON (h.PAIR_TYP = src.PAIR_TYP AND h.ID1 = src.ID1 AND h.ID2 = src.ID2)
     WHEN NOT MATCHED THEN
-        INSERT (PARTY_TYP, ID1, ID2, CREATED_DT)
-        VALUES (m.PARTY_TYP, m.ID1, m.ID2, SYSDATE);
-
+        INSERT (ID1, ID2, ID1_PARTY_TYP, ID2_PARTY_TYP, CREATED_DT)
+        VALUES (src.ID1, src.ID2, src.ID1_PARTY_TYP, src.ID2_PARTY_TYP, SYSDATE);
     COMMIT;
 
     ---------------------------------------------------------------------------
-    -- STEP 2: BUILD INTRA-TYPE SUBGRAPH IN PHYSICAL STAGING TABLES
+    -- STEP 2: BUILD EFFECTIVE PAIRS & TAG DEGREE-1 ISOLATED PAIRS
     ---------------------------------------------------------------------------
     IF UPPER(p_run_mode) = 'DAY1' THEN
         INSERT INTO STG_UNMERGE_RULES (WORK_STREAM, ANCHOR_NODE, TARGET_NODE)
-        SELECT DISTINCT p_party_typ, LEAST(ID1, ID2), GREATEST(ID1, ID2)
+        SELECT DISTINCT p_party_typ, ID1, ID2
           FROM PME_MANUAL_OVERRIDES
-         WHERE ISUNMERGE = 1
-           AND OVR_TYPE  = p_party_typ
-           AND ID1 <> ID2;
+         WHERE PAIR_TYP  = p_party_typ
+           AND ISUNMERGE = 1;
         COMMIT;
 
-        INSERT /*+ APPEND PARALLEL(4) */ INTO STG_ACTIVE_EDGES (WORK_STREAM, U_NODE, V_NODE)
+        INSERT /*+ APPEND PARALLEL(4) */ INTO STG_RAW_PAIRS (WORK_STREAM, ID1, ID2, IS_DEGREE_1)
         WITH EFFECTIVE_PAIRS AS (
             SELECT ID1, ID2
               FROM PME_MTCH_HIST
-             WHERE PARTY_TYP = p_party_typ
+             WHERE PAIR_TYP = p_party_typ
             UNION
-            SELECT LEAST(ID1, ID2), GREATEST(ID1, ID2)
+            SELECT ID1, ID2
               FROM PME_MANUAL_OVERRIDES
-             WHERE ISMERGE  = 1
-               AND OVR_TYPE = p_party_typ
-               AND ID1 <> ID2
+             WHERE PAIR_TYP = p_party_typ
+               AND ISMERGE  = 1
             MINUS
             SELECT ANCHOR_NODE, TARGET_NODE
               FROM STG_UNMERGE_RULES
              WHERE WORK_STREAM = p_party_typ
+        ),
+        NODE_DEGREES AS (
+            SELECT NODE_ID, COUNT(*) AS DEG
+              FROM (
+                SELECT ID1 AS NODE_ID FROM EFFECTIVE_PAIRS
+                UNION ALL
+                SELECT ID2 AS NODE_ID FROM EFFECTIVE_PAIRS
+              )
+             GROUP BY NODE_ID
         )
-        SELECT p_party_typ, ID1, ID2 FROM EFFECTIVE_PAIRS
-        UNION ALL
-        SELECT p_party_typ, ID2, ID1 FROM EFFECTIVE_PAIRS;
+        SELECT p_party_typ,
+               ep.ID1,
+               ep.ID2,
+               CASE
+                   WHEN d1.DEG = 1 AND d2.DEG = 1
+                    AND NOT EXISTS (
+                        SELECT 1 FROM STG_UNMERGE_RULES r
+                         WHERE r.WORK_STREAM = p_party_typ
+                           AND (r.ANCHOR_NODE IN (ep.ID1, ep.ID2) OR r.TARGET_NODE IN (ep.ID1, ep.ID2))
+                    )
+                   THEN 1
+                   ELSE 0
+               END AS IS_DEGREE_1
+          FROM EFFECTIVE_PAIRS ep
+          JOIN NODE_DEGREES d1 ON d1.NODE_ID = ep.ID1
+          JOIN NODE_DEGREES d2 ON d2.NODE_ID = ep.ID2;
         COMMIT;
 
+    ELSE
+        -- DELTA MODE: Expand any new neighbors introduced by today's PME_MTCH
+        LOOP
+            INSERT INTO STG_IMPACTED_NODES (WORK_STREAM, NODE_ID)
+            WITH NEW_DEPS AS (
+                SELECT CASE WHEN h.ID1 = i.NODE_ID THEN h.ID2 ELSE h.ID1 END AS DEP_NODE
+                  FROM PME_MTCH_HIST h
+                  JOIN STG_IMPACTED_NODES i
+                    ON (h.ID1 = i.NODE_ID OR h.ID2 = i.NODE_ID) AND i.WORK_STREAM = p_party_typ
+                 WHERE h.PAIR_TYP = p_party_typ
+                UNION
+                SELECT x.ORIG_ROWID_OBJECT AS DEP_NODE
+                  FROM PARTY_XREF x
+                 WHERE x.PARTY_TYP = p_party_typ
+                   AND x.ROWID_OBJECT IN (
+                       SELECT p.ROWID_OBJECT
+                         FROM PARTY_XREF p
+                         JOIN STG_IMPACTED_NODES i
+                           ON p.ORIG_ROWID_OBJECT = i.NODE_ID AND i.WORK_STREAM = p_party_typ
+                        WHERE p.PARTY_TYP = p_party_typ
+                   )
+            )
+            SELECT DISTINCT p_party_typ, d.DEP_NODE
+              FROM NEW_DEPS d
+             WHERE NOT EXISTS (
+                   SELECT 1 FROM STG_IMPACTED_NODES e
+                    WHERE e.WORK_STREAM = p_party_typ AND e.NODE_ID = d.DEP_NODE
+             );
+
+            EXIT WHEN SQL%ROWCOUNT = 0;
+            COMMIT;
+        END LOOP;
+
+        INSERT INTO STG_UNMERGE_RULES (WORK_STREAM, ANCHOR_NODE, TARGET_NODE)
+        SELECT DISTINCT p_party_typ, o.ID1, o.ID2
+          FROM PME_MANUAL_OVERRIDES o
+         WHERE o.PAIR_TYP  = p_party_typ
+           AND o.ISUNMERGE = 1
+           AND (EXISTS (SELECT 1 FROM STG_IMPACTED_NODES i WHERE i.WORK_STREAM = p_party_typ AND i.NODE_ID = o.ID1)
+             OR EXISTS (SELECT 1 FROM STG_IMPACTED_NODES i WHERE i.WORK_STREAM = p_party_typ AND i.NODE_ID = o.ID2));
+        COMMIT;
+
+        INSERT /*+ APPEND PARALLEL(4) */ INTO STG_RAW_PAIRS (WORK_STREAM, ID1, ID2, IS_DEGREE_1)
+        WITH EFFECTIVE_DELTA_PAIRS AS (
+            SELECT h.ID1, h.ID2
+              FROM PME_MTCH_HIST h
+             WHERE h.PAIR_TYP = p_party_typ
+               AND (EXISTS (SELECT 1 FROM STG_IMPACTED_NODES i WHERE i.WORK_STREAM = p_party_typ AND i.NODE_ID = h.ID1)
+                 OR EXISTS (SELECT 1 FROM STG_IMPACTED_NODES i WHERE i.WORK_STREAM = p_party_typ AND i.NODE_ID = h.ID2))
+            UNION
+            SELECT o.ID1, o.ID2
+              FROM PME_MANUAL_OVERRIDES o
+             WHERE o.PAIR_TYP = p_party_typ
+               AND o.ISMERGE  = 1
+               AND (EXISTS (SELECT 1 FROM STG_IMPACTED_NODES i WHERE i.WORK_STREAM = p_party_typ AND i.NODE_ID = o.ID1)
+                 OR EXISTS (SELECT 1 FROM STG_IMPACTED_NODES i WHERE i.WORK_STREAM = p_party_typ AND i.NODE_ID = o.ID2))
+            MINUS
+            SELECT ANCHOR_NODE, TARGET_NODE
+              FROM STG_UNMERGE_RULES
+             WHERE WORK_STREAM = p_party_typ
+        ),
+        NODE_DEGREES AS (
+            SELECT NODE_ID, COUNT(*) AS DEG
+              FROM (
+                SELECT ID1 AS NODE_ID FROM EFFECTIVE_DELTA_PAIRS
+                UNION ALL
+                SELECT ID2 AS NODE_ID FROM EFFECTIVE_DELTA_PAIRS
+              )
+             GROUP BY NODE_ID
+        )
+        SELECT p_party_typ,
+               ep.ID1,
+               ep.ID2,
+               CASE
+                   WHEN d1.DEG = 1 AND d2.DEG = 1
+                    AND NOT EXISTS (
+                        SELECT 1 FROM STG_UNMERGE_RULES r
+                         WHERE r.WORK_STREAM = p_party_typ
+                           AND (r.ANCHOR_NODE IN (ep.ID1, ep.ID2) OR r.TARGET_NODE IN (ep.ID1, ep.ID2))
+                    )
+                   THEN 1
+                   ELSE 0
+               END AS IS_DEGREE_1
+          FROM EFFECTIVE_DELTA_PAIRS ep
+          JOIN NODE_DEGREES d1 ON d1.NODE_ID = ep.ID1
+          JOIN NODE_DEGREES d2 ON d2.NODE_ID = ep.ID2;
+        COMMIT;
+    END IF;
+
+    ---------------------------------------------------------------------------
+    -- STEP 2B: POPULATE STG_ACTIVE_EDGES ONLY FOR COMPLEX CLUSTERS (IS_DEGREE_1 = 0)
+    ---------------------------------------------------------------------------
+    INSERT /*+ APPEND PARALLEL(4) */ INTO STG_ACTIVE_EDGES (WORK_STREAM, U_NODE, V_NODE)
+    SELECT p_party_typ, ID1, ID2
+      FROM STG_RAW_PAIRS
+     WHERE WORK_STREAM = p_party_typ AND IS_DEGREE_1 = 0
+    UNION ALL
+    SELECT p_party_typ, ID2, ID1
+      FROM STG_RAW_PAIRS
+     WHERE WORK_STREAM = p_party_typ AND IS_DEGREE_1 = 0;
+    COMMIT;
+
+    IF UPPER(p_run_mode) = 'DAY1' THEN
         INSERT /*+ APPEND PARALLEL(4) */ INTO STG_IMPACTED_NODES (WORK_STREAM, NODE_ID)
         SELECT p_party_typ, NODE_ID
           FROM (
@@ -246,103 +594,31 @@ BEGIN
               FROM PARTY_XREF
              WHERE PARTY_TYP = p_party_typ
                AND ROWID_OBJECT <> ORIG_ROWID_OBJECT
-          );
-        COMMIT;
-
-    ELSE
-        -- DELTA MODE FOR THIS PARTY_TYP
-        INSERT INTO STG_IMPACTED_NODES (WORK_STREAM, NODE_ID)
-        SELECT p_party_typ, NODE_ID
-          FROM (
-            SELECT ID1 AS NODE_ID FROM PME_MTCH WHERE PARTY_TYP = p_party_typ AND ID1 <> ID2
-            UNION
-            SELECT ID2 FROM PME_MTCH WHERE PARTY_TYP = p_party_typ AND ID1 <> ID2
-            UNION
-            SELECT ID1 FROM PME_MANUAL_OVERRIDES WHERE OVR_TYPE = p_party_typ AND (ISMERGE = 1 OR ISUNMERGE = 1)
-            UNION
-            SELECT ID2 FROM PME_MANUAL_OVERRIDES WHERE OVR_TYPE = p_party_typ AND (ISMERGE = 1 OR ISUNMERGE = 1)
-          );
-        COMMIT;
-
-        LOOP
-            INSERT INTO STG_IMPACTED_NODES (WORK_STREAM, NODE_ID)
-            WITH NEW_DEPS AS (
-                SELECT x.ORIG_ROWID_OBJECT AS DEP_NODE
-                  FROM PARTY_XREF x
-                 WHERE x.PARTY_TYP = p_party_typ
-                   AND x.ROWID_OBJECT IN (
-                       SELECT p.ROWID_OBJECT
-                         FROM PARTY_XREF p
-                         JOIN STG_IMPACTED_NODES i
-                           ON p.ORIG_ROWID_OBJECT = i.NODE_ID
-                          AND i.WORK_STREAM = p_party_typ
-                        WHERE p.PARTY_TYP = p_party_typ
-                       UNION
-                       SELECT NODE_ID FROM STG_IMPACTED_NODES WHERE WORK_STREAM = p_party_typ
-                   )
-                UNION
-                SELECT CASE WHEN h.ID1 = i.NODE_ID THEN h.ID2 ELSE h.ID1 END AS DEP_NODE
-                  FROM PME_MTCH_HIST h
-                  JOIN STG_IMPACTED_NODES i
-                    ON (h.ID1 = i.NODE_ID OR h.ID2 = i.NODE_ID)
-                   AND i.WORK_STREAM = p_party_typ
-                 WHERE h.PARTY_TYP = p_party_typ
-            )
-            SELECT DISTINCT p_party_typ, d.DEP_NODE
-              FROM NEW_DEPS d
-             WHERE NOT EXISTS (
-                   SELECT 1 FROM STG_IMPACTED_NODES e
-                    WHERE e.WORK_STREAM = p_party_typ
-                      AND e.NODE_ID = d.DEP_NODE
-             );
-
-            EXIT WHEN SQL%ROWCOUNT = 0;
-            COMMIT;
-        END LOOP;
-        COMMIT;
-
-        INSERT INTO STG_UNMERGE_RULES (WORK_STREAM, ANCHOR_NODE, TARGET_NODE)
-        SELECT DISTINCT p_party_typ, LEAST(o.ID1, o.ID2), GREATEST(o.ID1, o.ID2)
-          FROM PME_MANUAL_OVERRIDES o
-         WHERE o.ISUNMERGE = 1
-           AND o.OVR_TYPE  = p_party_typ
-           AND o.ID1 <> o.ID2
-           AND (EXISTS (SELECT 1 FROM STG_IMPACTED_NODES i WHERE i.WORK_STREAM = p_party_typ AND i.NODE_ID = o.ID1)
-             OR EXISTS (SELECT 1 FROM STG_IMPACTED_NODES i WHERE i.WORK_STREAM = p_party_typ AND i.NODE_ID = o.ID2));
-        COMMIT;
-
-        INSERT /*+ APPEND PARALLEL(4) */ INTO STG_ACTIVE_EDGES (WORK_STREAM, U_NODE, V_NODE)
-        WITH EFFECTIVE_DELTA_PAIRS AS (
-            SELECT h.ID1, h.ID2
-              FROM PME_MTCH_HIST h
-             WHERE h.PARTY_TYP = p_party_typ
-               AND (EXISTS (SELECT 1 FROM STG_IMPACTED_NODES i WHERE i.WORK_STREAM = p_party_typ AND i.NODE_ID = h.ID1)
-                 OR EXISTS (SELECT 1 FROM STG_IMPACTED_NODES i WHERE i.WORK_STREAM = p_party_typ AND i.NODE_ID = h.ID2))
-            UNION
-            SELECT LEAST(o.ID1, o.ID2), GREATEST(o.ID1, o.ID2)
-              FROM PME_MANUAL_OVERRIDES o
-             WHERE o.ISMERGE  = 1
-               AND o.OVR_TYPE = p_party_typ
-               AND o.ID1 <> o.ID2
-               AND (EXISTS (SELECT 1 FROM STG_IMPACTED_NODES i WHERE i.WORK_STREAM = p_party_typ AND i.NODE_ID = o.ID1)
-                 OR EXISTS (SELECT 1 FROM STG_IMPACTED_NODES i WHERE i.WORK_STREAM = p_party_typ AND i.NODE_ID = o.ID2))
             MINUS
-            SELECT ANCHOR_NODE, TARGET_NODE
-              FROM STG_UNMERGE_RULES
-             WHERE WORK_STREAM = p_party_typ
-        )
-        SELECT p_party_typ, ID1, ID2 FROM EFFECTIVE_DELTA_PAIRS
-        UNION ALL
-        SELECT p_party_typ, ID2, ID1 FROM EFFECTIVE_DELTA_PAIRS;
+            SELECT ID1 FROM STG_RAW_PAIRS WHERE WORK_STREAM = p_party_typ AND IS_DEGREE_1 = 1
+            MINUS
+            SELECT ID2 FROM STG_RAW_PAIRS WHERE WORK_STREAM = p_party_typ AND IS_DEGREE_1 = 1
+          );
+        COMMIT;
+    ELSE
+        -- Remove Degree-1 fast-path nodes from STG_IMPACTED_NODES while keeping
+        -- all complex nodes AND 0-edge auto-unmerged nodes
+        DELETE FROM STG_IMPACTED_NODES i
+         WHERE i.WORK_STREAM = p_party_typ
+           AND EXISTS (
+               SELECT 1 FROM STG_RAW_PAIRS r
+                WHERE r.WORK_STREAM = p_party_typ
+                  AND r.IS_DEGREE_1 = 1
+                  AND (r.ID1 = i.NODE_ID OR r.ID2 = i.NODE_ID)
+           );
         COMMIT;
     END IF;
 
-    -- Gather partition stats so Oracle picks optimal hash joins for 160M rows
     DBMS_STATS.GATHER_TABLE_STATS(USER, 'STG_ACTIVE_EDGES',   PARTNAME => v_part_name, GRANULARITY => 'PARTITION');
     DBMS_STATS.GATHER_TABLE_STATS(USER, 'STG_IMPACTED_NODES', PARTNAME => v_part_name, GRANULARITY => 'PARTITION');
 
     ---------------------------------------------------------------------------
-    -- STEP 3: TRANSITIVE BRIDGE PRUNING & CONVERGENCE
+    -- STEP 3: 2-PASS TRANSITIVE BRIDGE CUTTING + CONVERGENCE + DEGREE-1 APPEND
     ---------------------------------------------------------------------------
     DECLARE
         v_unmerge_cnt NUMBER;
@@ -352,8 +628,35 @@ BEGIN
          WHERE WORK_STREAM = p_party_typ;
 
         IF v_unmerge_cnt > 0 THEN
+            -- Pass 1: Holdout unmerge target nodes
             run_label_propagation(p_exclude_targets => TRUE);
 
+            -- Audit log transitive bridges being severed
+            INSERT INTO PME_TRANSITIVE_CUT_LOG (
+                WORK_STREAM, UNMERGE_ANCHOR, UNMERGE_TARGET, CUT_NODE_1, CUT_NODE_2, LOGGED_DT
+            )
+            SELECT DISTINCT
+                   p_party_typ,
+                   r.ANCHOR_NODE,
+                   r.TARGET_NODE,
+                   LEAST(e.U_NODE, e.V_NODE),
+                   GREATEST(e.U_NODE, e.V_NODE),
+                   SYSDATE
+              FROM STG_UNMERGE_RULES r
+              JOIN STG_NODE_CLUSTER ca ON ca.WORK_STREAM = p_party_typ AND ca.NODE_ID = r.ANCHOR_NODE
+              JOIN STG_ACTIVE_EDGES e  ON e.WORK_STREAM  = p_party_typ AND e.V_NODE   = r.TARGET_NODE
+              JOIN STG_NODE_CLUSTER cw ON cw.WORK_STREAM = p_party_typ AND cw.NODE_ID = e.U_NODE
+             WHERE r.WORK_STREAM   = p_party_typ
+               AND cw.CLUSTER_ROOT = ca.CLUSTER_ROOT
+               AND NOT EXISTS (
+                   SELECT 1 FROM PME_MANUAL_OVERRIDES m
+                    WHERE m.PAIR_TYP = p_party_typ
+                      AND m.ISMERGE  = 1
+                      AND m.ID1      = LEAST(e.U_NODE, e.V_NODE)
+                      AND m.ID2      = GREATEST(e.U_NODE, e.V_NODE)
+               );
+
+            -- Sever transitive bridges
             DELETE FROM STG_ACTIVE_EDGES e
              WHERE e.WORK_STREAM = p_party_typ
                AND EXISTS (
@@ -369,28 +672,42 @@ BEGIN
                )
                AND NOT EXISTS (
                    SELECT 1 FROM PME_MANUAL_OVERRIDES m
-                    WHERE m.ISMERGE  = 1
-                      AND m.OVR_TYPE = p_party_typ
-                      AND LEAST(m.ID1, m.ID2)    = LEAST(e.U_NODE, e.V_NODE)
-                      AND GREATEST(m.ID1, m.ID2) = GREATEST(e.U_NODE, e.V_NODE)
+                    WHERE m.PAIR_TYP = p_party_typ
+                      AND m.ISMERGE  = 1
+                      AND m.ID1      = LEAST(e.U_NODE, e.V_NODE)
+                      AND m.ID2      = GREATEST(e.U_NODE, e.V_NODE)
                );
             COMMIT;
         END IF;
 
+        -- Pass 2: Final Convergence
         run_label_propagation(p_exclude_targets => FALSE);
     END;
 
+    -- 3b. Append pre-solved Degree-1 pairs directly into STG_NODE_CLUSTER
+    INSERT /*+ APPEND PARALLEL(4) */ INTO STG_NODE_CLUSTER (WORK_STREAM, NODE_ID, CLUSTER_ROOT)
+    SELECT p_party_typ, ID1, ID1
+      FROM STG_RAW_PAIRS
+     WHERE WORK_STREAM = p_party_typ AND IS_DEGREE_1 = 1
+    UNION ALL
+    SELECT p_party_typ, ID2, ID1
+      FROM STG_RAW_PAIRS
+     WHERE WORK_STREAM = p_party_typ AND IS_DEGREE_1 = 1;
+    COMMIT;
+
     ---------------------------------------------------------------------------
-    -- STEP 4: STAGE RESULTS INTO THIS PARTY_TYP'S PARTITION
+    -- STEP 4: SYNC PME_CLUSTER_RESULT & UPDATE PARTY_XREF
     ---------------------------------------------------------------------------
     DELETE FROM PME_CLUSTER_RESULT
-     WHERE PARTY_TYP = p_party_typ
+     WHERE NODE_PARTY_TYP = p_party_typ
        AND NODE_ID IN (
            SELECT NODE_ID FROM STG_NODE_CLUSTER WHERE WORK_STREAM = p_party_typ
        );
 
-    INSERT /*+ APPEND */ INTO PME_CLUSTER_RESULT (PARTY_TYP, CLUSTER_ROOT, NODE_ID, UPDATED_DT)
-    SELECT p_party_typ, CLUSTER_ROOT, NODE_ID, SYSDATE
+    INSERT /*+ APPEND */ INTO PME_CLUSTER_RESULT (
+        CLUSTER_ROOT, NODE_ID, ROOT_PARTY_TYP, NODE_PARTY_TYP, UPDATED_DT
+    )
+    SELECT CLUSTER_ROOT, NODE_ID, p_party_typ, p_party_typ, SYSDATE
       FROM STG_NODE_CLUSTER
      WHERE WORK_STREAM = p_party_typ
        AND CLUSTER_ROOT <> NODE_ID;
@@ -410,12 +727,7 @@ BEGIN
     COMMIT;
 END PRC_RUN_MDM_MERGE_BY_TYPE;
 /
-
-
-/*
-3. Phase 3 Procedure (CROSS Reconciliation Using Physical Tables)
-Phase 3 uses WORK_STREAM = 'CROSS' (PARTITION P_CROSS) on the physical staging tables:
-*/
+--------------------------
 
 CREATE OR REPLACE PROCEDURE PRC_RUN_CROSS_TYPE_MERGE (
     p_run_mode IN VARCHAR2 DEFAULT 'DELTA' -- 'DAY1' or 'DELTA'
@@ -500,6 +812,7 @@ CREATE OR REPLACE PROCEDURE PRC_RUN_CROSS_TYPE_MERGE (
 
 BEGIN
     -- Clear P_CROSS partitions
+    truncate_cross_partition('STG_RAW_PAIRS');
     truncate_cross_partition('STG_ACTIVE_EDGES');
     truncate_cross_partition('STG_NODE_CLUSTER');
     truncate_cross_partition('STG_IMPACTED_NODES');
@@ -512,18 +825,24 @@ BEGIN
         MERGE INTO PME_MTCH_HIST h
         USING (
             SELECT DISTINCT
-                   'CROSS'                                          AS PARTY_TYP,
-                   LEAST(x1.ROWID_OBJECT, x1.ORIG_ROWID_OBJECT)    AS ID1,
-                   GREATEST(x1.ROWID_OBJECT, x1.ORIG_ROWID_OBJECT) AS ID2
+                   CASE WHEN x1.ROWID_OBJECT < x1.ORIG_ROWID_OBJECT
+                        THEN x1.ROWID_OBJECT      ELSE x1.ORIG_ROWID_OBJECT END AS ID1,
+                   CASE WHEN x1.ROWID_OBJECT < x1.ORIG_ROWID_OBJECT
+                        THEN x1.ORIG_ROWID_OBJECT ELSE x1.ROWID_OBJECT      END AS ID2,
+                   CASE WHEN x1.ROWID_OBJECT < x1.ORIG_ROWID_OBJECT
+                        THEN x2.PARTY_TYP         ELSE x1.PARTY_TYP         END AS ID1_PARTY_TYP,
+                   CASE WHEN x1.ROWID_OBJECT < x1.ORIG_ROWID_OBJECT
+                        THEN x1.PARTY_TYP         ELSE x2.PARTY_TYP         END AS ID2_PARTY_TYP,
+                   'CROSS' AS CALC_PAIR_TYP
               FROM PARTY_XREF x1
               JOIN PARTY_XREF x2 ON x1.ROWID_OBJECT = x2.ORIG_ROWID_OBJECT
              WHERE x1.ROWID_OBJECT <> x1.ORIG_ROWID_OBJECT
                AND x1.PARTY_TYP <> x2.PARTY_TYP
         ) x
-        ON (h.PARTY_TYP = x.PARTY_TYP AND h.ID1 = x.ID1 AND h.ID2 = x.ID2)
+        ON (h.PAIR_TYP = x.CALC_PAIR_TYP AND h.ID1 = x.ID1 AND h.ID2 = x.ID2)
         WHEN NOT MATCHED THEN
-            INSERT (PARTY_TYP, ID1, ID2, CREATED_DT)
-            VALUES (x.PARTY_TYP, x.ID1, x.ID2, SYSDATE);
+            INSERT (ID1, ID2, ID1_PARTY_TYP, ID2_PARTY_TYP, CREATED_DT)
+            VALUES (x.ID1, x.ID2, x.ID1_PARTY_TYP, x.ID2_PARTY_TYP, SYSDATE);
         COMMIT;
     END IF;
 
@@ -533,13 +852,13 @@ BEGIN
     INSERT INTO STG_IMPACTED_NODES (WORK_STREAM, NODE_ID)
     SELECT 'CROSS', NODE_ID
       FROM (
-        SELECT ID1 AS NODE_ID FROM PME_MANUAL_OVERRIDES WHERE OVR_TYPE = 'CROSS' AND (ISMERGE = 1 OR ISUNMERGE = 1)
+        SELECT ID1 AS NODE_ID FROM PME_MANUAL_OVERRIDES WHERE PAIR_TYP = 'CROSS' AND (ISMERGE = 1 OR ISUNMERGE = 1)
         UNION
-        SELECT ID2 FROM PME_MANUAL_OVERRIDES WHERE OVR_TYPE = 'CROSS' AND (ISMERGE = 1 OR ISUNMERGE = 1)
+        SELECT ID2 FROM PME_MANUAL_OVERRIDES WHERE PAIR_TYP = 'CROSS' AND (ISMERGE = 1 OR ISUNMERGE = 1)
         UNION
-        SELECT ID1 FROM PME_MTCH_HIST WHERE PARTY_TYP = 'CROSS'
+        SELECT ID1 FROM PME_MTCH_HIST WHERE PAIR_TYP = 'CROSS'
         UNION
-        SELECT ID2 FROM PME_MTCH_HIST WHERE PARTY_TYP = 'CROSS'
+        SELECT ID2 FROM PME_MTCH_HIST WHERE PAIR_TYP = 'CROSS'
       );
 
     v_cross_cnt := SQL%ROWCOUNT;
@@ -596,10 +915,9 @@ BEGIN
     -- STEP 4: LOAD UNMERGE RULES & ACTIVE EDGES INTO PARTITION P_CROSS
     ---------------------------------------------------------------------------
     INSERT INTO STG_UNMERGE_RULES (WORK_STREAM, ANCHOR_NODE, TARGET_NODE)
-    SELECT DISTINCT 'CROSS', LEAST(o.ID1, o.ID2), GREATEST(o.ID1, o.ID2)
+    SELECT DISTINCT 'CROSS', o.ID1, o.ID2
       FROM PME_MANUAL_OVERRIDES o
      WHERE o.ISUNMERGE = 1
-       AND o.ID1 <> o.ID2
        AND (EXISTS (SELECT 1 FROM STG_IMPACTED_NODES i WHERE i.WORK_STREAM = 'CROSS' AND i.NODE_ID = o.ID1)
          OR EXISTS (SELECT 1 FROM STG_IMPACTED_NODES i WHERE i.WORK_STREAM = 'CROSS' AND i.NODE_ID = o.ID2));
     COMMIT;
@@ -611,10 +929,9 @@ BEGIN
          WHERE EXISTS (SELECT 1 FROM STG_IMPACTED_NODES i WHERE i.WORK_STREAM = 'CROSS' AND i.NODE_ID = h.ID1)
            AND EXISTS (SELECT 1 FROM STG_IMPACTED_NODES i WHERE i.WORK_STREAM = 'CROSS' AND i.NODE_ID = h.ID2)
         UNION
-        SELECT LEAST(o.ID1, o.ID2), GREATEST(o.ID1, o.ID2)
+        SELECT o.ID1, o.ID2
           FROM PME_MANUAL_OVERRIDES o
          WHERE o.ISMERGE = 1
-           AND o.ID1 <> o.ID2
            AND EXISTS (SELECT 1 FROM STG_IMPACTED_NODES i WHERE i.WORK_STREAM = 'CROSS' AND i.NODE_ID = o.ID1)
            AND EXISTS (SELECT 1 FROM STG_IMPACTED_NODES i WHERE i.WORK_STREAM = 'CROSS' AND i.NODE_ID = o.ID2)
         MINUS
@@ -640,6 +957,29 @@ BEGIN
         IF v_unmerge_cnt > 0 THEN
             run_label_propagation(p_exclude_targets => TRUE);
 
+            INSERT INTO PME_TRANSITIVE_CUT_LOG (
+                WORK_STREAM, UNMERGE_ANCHOR, UNMERGE_TARGET, CUT_NODE_1, CUT_NODE_2, LOGGED_DT
+            )
+            SELECT DISTINCT
+                   'CROSS',
+                   r.ANCHOR_NODE,
+                   r.TARGET_NODE,
+                   LEAST(e.U_NODE, e.V_NODE),
+                   GREATEST(e.U_NODE, e.V_NODE),
+                   SYSDATE
+              FROM STG_UNMERGE_RULES r
+              JOIN STG_NODE_CLUSTER ca ON ca.WORK_STREAM = 'CROSS' AND ca.NODE_ID = r.ANCHOR_NODE
+              JOIN STG_ACTIVE_EDGES e  ON e.WORK_STREAM  = 'CROSS' AND e.V_NODE   = r.TARGET_NODE
+              JOIN STG_NODE_CLUSTER cw ON cw.WORK_STREAM = 'CROSS' AND cw.NODE_ID = e.U_NODE
+             WHERE r.WORK_STREAM   = 'CROSS'
+               AND cw.CLUSTER_ROOT = ca.CLUSTER_ROOT
+               AND NOT EXISTS (
+                   SELECT 1 FROM PME_MANUAL_OVERRIDES m
+                    WHERE m.ISMERGE = 1
+                      AND m.ID1     = LEAST(e.U_NODE, e.V_NODE)
+                      AND m.ID2     = GREATEST(e.U_NODE, e.V_NODE)
+               );
+
             DELETE FROM STG_ACTIVE_EDGES e
              WHERE e.WORK_STREAM = 'CROSS'
                AND EXISTS (
@@ -656,8 +996,8 @@ BEGIN
                AND NOT EXISTS (
                    SELECT 1 FROM PME_MANUAL_OVERRIDES m
                     WHERE m.ISMERGE = 1
-                      AND LEAST(m.ID1, m.ID2)    = LEAST(e.U_NODE, e.V_NODE)
-                      AND GREATEST(m.ID1, m.ID2) = GREATEST(e.U_NODE, e.V_NODE)
+                      AND m.ID1     = LEAST(e.U_NODE, e.V_NODE)
+                      AND m.ID2     = GREATEST(e.U_NODE, e.V_NODE)
                );
             COMMIT;
         END IF;
@@ -673,10 +1013,17 @@ BEGIN
          SELECT NODE_ID FROM STG_NODE_CLUSTER WHERE WORK_STREAM = 'CROSS'
      );
 
-    INSERT INTO PME_CLUSTER_RESULT (PARTY_TYP, CLUSTER_ROOT, NODE_ID, UPDATED_DT)
-    SELECT x.PARTY_TYP, c.CLUSTER_ROOT, c.NODE_ID, SYSDATE
+    INSERT INTO PME_CLUSTER_RESULT (
+        CLUSTER_ROOT, NODE_ID, ROOT_PARTY_TYP, NODE_PARTY_TYP, UPDATED_DT
+    )
+    SELECT c.CLUSTER_ROOT,
+           c.NODE_ID,
+           xr.PARTY_TYP AS ROOT_PARTY_TYP,
+           xn.PARTY_TYP AS NODE_PARTY_TYP,
+           SYSDATE
       FROM STG_NODE_CLUSTER c
-      JOIN PARTY_XREF x ON x.ORIG_ROWID_OBJECT = c.NODE_ID
+      JOIN PARTY_XREF xn ON xn.ORIG_ROWID_OBJECT = c.NODE_ID
+      JOIN PARTY_XREF xr ON xr.ORIG_ROWID_OBJECT = c.CLUSTER_ROOT
      WHERE c.WORK_STREAM = 'CROSS'
        AND c.CLUSTER_ROOT <> c.NODE_ID;
     COMMIT;
@@ -695,3 +1042,114 @@ BEGIN
     COMMIT;
 END PRC_RUN_CROSS_TYPE_MERGE;
 /
+
+-----------------------
+
+CREATE OR REPLACE PROCEDURE PRC_ORCHESTRATE_MDM_MERGE (
+    p_run_mode IN VARCHAR2 DEFAULT 'DELTA' -- Pass 'DAY1' or 'DELTA'
+) AS
+    v_running_jobs NUMBER := 2;
+    v_failed_cnt   NUMBER := 0;
+BEGIN
+    -- 1. Launch BSNS cluster job asynchronously
+    DBMS_SCHEDULER.CREATE_JOB (
+        job_name   => 'JOB_MDM_MERGE_BSNS',
+        job_type   => 'PLSQL_BLOCK',
+        job_action => 'BEGIN PRC_RUN_MDM_MERGE_BY_TYPE(''BSNS'', ''' || UPPER(p_run_mode) || '''); END;',
+        enabled    => TRUE,
+        auto_drop  => TRUE
+    );
+
+    -- 2. Launch INDVL cluster job asynchronously (Runs in parallel with BSNS)
+    DBMS_SCHEDULER.CREATE_JOB (
+        job_name   => 'JOB_MDM_MERGE_INDVL',
+        job_type   => 'PLSQL_BLOCK',
+        job_action => 'BEGIN PRC_RUN_MDM_MERGE_BY_TYPE(''INDVL'', ''' || UPPER(p_run_mode) || '''); END;',
+        enabled    => TRUE,
+        auto_drop  => TRUE
+    );
+
+    -- 3. Poll until both parallel jobs finish
+    LOOP
+        SELECT COUNT(*)
+          INTO v_running_jobs
+          FROM USER_SCHEDULER_JOBS
+         WHERE JOB_NAME IN ('JOB_MDM_MERGE_BSNS', 'JOB_MDM_MERGE_INDVL');
+
+        EXIT WHEN v_running_jobs = 0;
+        DBMS_SESSION.SLEEP(2);
+    END LOOP;
+
+    -- 4. Verify both parallel jobs succeeded
+    SELECT COUNT(*)
+      INTO v_failed_cnt
+      FROM USER_SCHEDULER_JOB_RUN_DETAILS
+     WHERE JOB_NAME IN ('JOB_MDM_MERGE_BSNS', 'JOB_MDM_MERGE_INDVL')
+       AND LOG_DATE > SYSDATE - (1/24)
+       AND STATUS <> 'SUCCEEDED';
+
+    IF v_failed_cnt > 0 THEN
+        RAISE_APPLICATION_ERROR(-20001, 'BSNS or INDVL merge job failed. Check USER_SCHEDULER_JOB_RUN_DETAILS.');
+    END IF;
+
+    -- 5. Execute Phase 3: Sequential Cross-Type Reconciliation
+    PRC_RUN_CROSS_TYPE_MERGE(p_run_mode => UPPER(p_run_mode));
+END PRC_ORCHESTRATE_MDM_MERGE;
+/
+--------------------- Test data
+
+-------------------------------------------------------------------------------
+-- SAMPLE DML: SEEDING & RUNNING DAY 1
+-------------------------------------------------------------------------------
+-- 1. Example PARTY_XREF rows (including a pre-existing CROSS merge 10 <- 20)
+INSERT INTO PARTY_XREF VALUES (1,  1,  'INDVL');
+INSERT INTO PARTY_XREF VALUES (2,  2,  'INDVL');
+INSERT INTO PARTY_XREF VALUES (3,  3,  'INDVL');
+INSERT INTO PARTY_XREF VALUES (10, 10, 'BSNS');
+INSERT INTO PARTY_XREF VALUES (20, 10, 'INDVL'); -- Historical CROSS merge in PARTY_XREF
+INSERT INTO PARTY_XREF VALUES (30, 30, 'BSNS');
+INSERT INTO PARTY_XREF VALUES (40, 40, 'BSNS');
+
+-- 2. Example Day 1 PME_MTCH rows
+INSERT INTO PME_MTCH (ID1, ID2, ID1_PARTY_TYP, ID2_PARTY_TYP) VALUES (1,  2,  'INDVL', 'INDVL');
+INSERT INTO PME_MTCH (ID1, ID2, ID1_PARTY_TYP, ID2_PARTY_TYP) VALUES (2,  3,  'INDVL', 'INDVL');
+INSERT INTO PME_MTCH (ID1, ID2, ID1_PARTY_TYP, ID2_PARTY_TYP) VALUES (30, 40, 'BSNS',  'BSNS'); -- Degree-1 fast-path pair
+COMMIT;
+
+-- 3. Run Day 1 Full Volume Merge
+--    (To run synchronously in a single session without DBMS_SCHEDULER, call the 3 procs directly;
+--     to run BSNS & INDVL in parallel background jobs, call PRC_ORCHESTRATE_MDM_MERGE('DAY1'))
+BEGIN
+    PRC_RUN_MDM_MERGE_BY_TYPE('BSNS',  'DAY1');
+    PRC_RUN_MDM_MERGE_BY_TYPE('INDVL', 'DAY1');
+    PRC_RUN_CROSS_TYPE_MERGE('DAY1');
+END;
+/
+
+-------------------------------------------------------------------------------
+-- SAMPLE DML: RUNNING DAY 2 (DELTA + AUTO-UNMERGE + MANUAL OVERRIDE)
+-------------------------------------------------------------------------------
+TRUNCATE TABLE PME_MTCH;
+TRUNCATE TABLE PME_SENT_PARTIES;
+
+-- Suppose INDVL node 3 had a core attribute change, was sent to PME, and returned 0 matches
+INSERT INTO PME_SENT_PARTIES (PARTY_TYP, NODE_ID) VALUES ('INDVL', 3);
+
+-- Suppose a steward manually unmerged the historical CROSS pair (10, 20)
+-- (Notice we can pass (20, 10) out of order; the trigger normalizes it to (10, 20)!)
+INSERT INTO PME_MANUAL_OVERRIDES (ID1, ID2, ID1_PARTY_TYP, ID2_PARTY_TYP, ISMERGE, ISUNMERGE)
+VALUES (20, 10, 'INDVL', 'BSNS', 0, 1);
+COMMIT;
+
+-- Run Day 2 Delta Merge
+BEGIN
+    PRC_RUN_MDM_MERGE_BY_TYPE('BSNS',  'DELTA');
+    PRC_RUN_MDM_MERGE_BY_TYPE('INDVL', 'DELTA');
+    PRC_RUN_CROSS_TYPE_MERGE('DELTA');
+END;
+/
+
+-- Inspect Final Results
+SELECT * FROM PARTY_XREF ORDER BY ORIG_ROWID_OBJECT;
+SELECT * FROM PME_CLUSTER_RESULT ORDER BY CLUSTER_ROOT, NODE_ID;
+
